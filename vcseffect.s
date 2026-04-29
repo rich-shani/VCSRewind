@@ -114,7 +114,10 @@ BLTAMOD         EQU     $064
 BLTBMOD         EQU     $062
 BLTCMOD         EQU     $060
 BLTDMOD         EQU     $066
-BLTDAT          EQU     $074
+BLTCDAT         EQU     $06E        ; blitter C data register
+BLTBDAT         EQU     $070        ; blitter B data register
+BLTADAT         EQU     $072        ; blitter A data (constant fill source)
+BLTDAT          EQU     $074        ; blitter D data (alias)
 
 ; Blitter status
 DMACONR_BBUSY   EQU     $0040
@@ -243,7 +246,8 @@ VAR_ORIGVBL     EQU     40          ; long - original VBL vector
 VAR_ORIGDMA     EQU     44          ; word - original DMACON
 VAR_ORIGINTE    EQU     46          ; word - original INTENA
 VAR_SAVED_A6    EQU     48          ; long - saved exec base for interrupt
-VAR_SIZE        EQU     52          ; total bytes needed
+VAR_SRCBUF      EQU     52          ; long - clean source screen (never modified)
+VAR_SIZE        EQU     56          ; total bytes needed
 
 *=============================================================================
 * PROGRAM START
@@ -321,6 +325,14 @@ AllocChipMem:
     beq     .fail
     move.l  d0,ScreenBufB
 
+    ; Allocate Screen Buffer C — clean source, never modified by effect
+    move.l  #SCREEN_SIZE,d0
+    move.l  #MEMF_CHIP|MEMF_CLEAR,d1
+    jsr     LVO_ALLOCMEM(a6)
+    tst.l   d0
+    beq     .fail
+    move.l  d0,ScreenBufC
+
     ; Allocate Noise Plane (CHIP, CLEAR)
     move.l  #NOISE_SIZE,d0
     move.l  #MEMF_CHIP|MEMF_CLEAR,d1
@@ -380,6 +392,12 @@ FreeChipMem:
     move.l  #SCREEN_SIZE,d0
     jsr     LVO_FREEMEM(a6)
 .f2:
+    move.l  ScreenBufC,d0
+    beq     .f2b
+    move.l  d0,a1
+    move.l  #SCREEN_SIZE,d0
+    jsr     LVO_FREEMEM(a6)
+.f2b:
     move.l  NoisePlane,d0
     beq     .f3
     move.l  d0,a1
@@ -421,6 +439,9 @@ InitVars:
     move.l  CopListA,VAR_COPLIST(a0)
     move.l  CopListB,VAR_COPLIST2(a0)
 
+    ; Clean source buffer (read-only)
+    move.l  ScreenBufC,VAR_SRCBUF(a0)
+
     ; Noise buffer
     move.l  NoisePlane,VAR_NOISEBUF(a0)
 
@@ -450,13 +471,21 @@ BuildTestScreen:
     move.l  ScreenBufA,a0
     bsr     FillScreenPattern
 
-    ; Copy A to B so both buffers start identical
+    ; Copy A to B (draw buffer)
     move.l  ScreenBufA,a0
     move.l  ScreenBufB,a1
     move.l  #SCREEN_SIZE/4-1,d7
 .copy:
     move.l  (a0)+,(a1)+
     dbra    d7,.copy
+
+    ; Copy A to C (clean source — never written to again)
+    move.l  ScreenBufA,a0
+    move.l  ScreenBufC,a1
+    move.l  #SCREEN_SIZE/4-1,d7
+.copyc:
+    move.l  (a0)+,(a1)+
+    dbra    d7,.copyc
     rts
 
 ; -------------------------------------------------------
@@ -534,23 +563,6 @@ FillScreenPattern:
     addq.w  #1,d5
     cmp.w   #SCREEN_PLANES,d5
     blt     .plane_loop
-
-    ; Now draw vertical stripes every 16 pixels on plane 0 (XOR)
-    ; This gives thin bright lines that show up tearing nicely
-    move.l  a2,a1           ; plane 0
-    moveq   #0,d6           ; Y
-.stripe_row:
-    move.w  #(PLANE_STRIDE/2)-1,d7
-    moveq   #0,d4           ; X word counter
-.stripe_word:
-    ; Put a single bit per 16-pixel word → $8000
-    move.w  #$8000,d0
-    eor.w   d0,(a1)+
-    addq.w  #1,d4
-    dbra    d7,.stripe_word
-    addq.w  #1,d6
-    cmp.w   #SCREEN_H,d6
-    blt     .stripe_row
 
     movem.l (sp)+,d0-d7/a0-a2
     rts
@@ -750,8 +762,19 @@ VBlankHandler:
     bra     .swap
 
 .do_normal:
-    ; Normal display — just ensure copper is correct
-    bsr     BuildNormalCopperList
+    ; Normal display — rebuild BOTH copper lists every frame so neither
+    ; buffer retains stale per-line BPLxPT entries from the effect.
+    ; BuildNormalCopperList writes to VAR_COPLIST2 (inactive).
+    ; We call it, swap, call it again → both buffers are clean.
+    bsr     BuildNormalCopperList      ; fill inactive list (COPLIST2)
+
+    ; Swap now so COPLIST2 becomes COPLIST (active next frame)
+    move.l  VAR_COPLIST(a5),d0
+    move.l  VAR_COPLIST2(a5),d1
+    move.l  d1,VAR_COPLIST(a5)
+    move.l  d0,VAR_COPLIST2(a5)
+
+    bsr     BuildNormalCopperList      ; fill the other buffer too (now COPLIST2)
     bsr     ApplyNormalPalette
 
 .swap:
@@ -938,6 +961,8 @@ UpdateStateMachine:
     move.w  #STATE_NORMAL,VAR_STATE(a5)
     move.w  #0,VAR_DISTORT(a5)
     move.w  #0,VAR_VERTROLL(a5)
+    ; Zero the shift table so no residual horizontal offsets remain
+    bsr     ClearShiftTable
     bra     .done
 
 .done_out_still:
@@ -1124,6 +1149,22 @@ BuildShiftTable:
     rts
 
 *=============================================================================
+* CLEAR SHIFT TABLE
+* Zeros all 256 entries in LineShiftTable.
+* Called when reverting to normal display to eliminate residual shifts.
+*=============================================================================
+
+ClearShiftTable:
+    movem.l d0/a0,-(sp)
+    lea     LineShiftTable,a0
+    move.w  #255,d0                  ; dbra counter: 256 words (255 downto 0)
+.cst_loop:
+    clr.w   (a0)+
+    dbra    d0,.cst_loop
+    movem.l (sp)+,d0/a0
+    rts
+
+*=============================================================================
 * WAIT FOR BLITTER
 * Polls DMACONR until blitter is idle.
 *=============================================================================
@@ -1136,118 +1177,122 @@ WaitBlit:
 
 *=============================================================================
 * DO VERTICAL ROLL
-* Copies the DISPLAY buffer into the DRAW buffer with a vertical offset.
-* Uses the blitter for speed.
+* Copies the CLEAN SOURCE buffer into the DRAW buffer with a vertical roll
+* offset. Using the clean source (never modified) ensures the original image
+* is always perfectly preserved — no accumulation of effect corruption.
 * VertRoll = number of lines to roll up.
 *=============================================================================
 
 DoVerticalRoll:
-    movem.l d0-d4/a0-a2,-(sp)
+    ; Save ALL registers we use — a3 and a4 were previously missing,
+    ; causing BuildEffectCopperList's a3 (LineShiftTable ptr) to be trashed.
+    movem.l d0-d4/a0-a4,-(sp)
 
     move.w  VAR_VERTROLL(a5),d3        ; d3 = roll amount in lines
     beq     .no_roll                   ; 0 = no roll needed
 
-    move.l  VAR_DISPBUF(a5),a0        ; source = display buffer
+    move.l  VAR_SRCBUF(a5),a0         ; source = CLEAN source buffer (never corrupted)
     move.l  VAR_DRAWBUF(a5),a1        ; dest   = draw buffer
 
-    ; We roll plane by plane (5 planes)
-    move.w  #SCREEN_PLANES-1,d4        ; plane counter
+    ; Roll plane by plane (5 planes = indices 4 downto 0 via dbra)
+    move.w  #SCREEN_PLANES-1,d4        ; plane loop counter
 
 .roll_plane:
-    ; Source plane base: a0 + plane_idx * PLANE_SIZE
-    move.l  a0,a2
+    ; Compute plane base addresses for this plane index (d4)
     move.w  d4,d0
-    mulu    #PLANE_SIZE,d0
+    mulu    #PLANE_SIZE,d0             ; d0.l = plane_idx * PLANE_SIZE
+
+    move.l  a0,a2                      ; a2 = source plane base
     add.l   d0,a2
 
-    ; Dest plane base
-    move.l  a1,a3
+    move.l  a1,a3                      ; a3 = dest plane base
     add.l   d0,a3
 
-    ; Part 1: copy source[VertRoll..255] to dest[0..255-VertRoll]
-    ;   source ptr = a2 + VertRoll * PLANE_STRIDE
-    ;   dest   ptr = a3
-    ;   lines       = SCREEN_H - VertRoll
+    ; ── PART 1: copy source[VertRoll..H-1] → dest[0..H-1-VertRoll] ──
+    ; Source start = a2 + VertRoll*PLANE_STRIDE
     move.w  d3,d0
     mulu    #PLANE_STRIDE,d0           ; d0.l = VertRoll * PLANE_STRIDE
     move.l  a2,d1
-    add.l   d0,d1                      ; d1 = a2 + offset (no .l index on 68000)
-    move.l  d1,a4                      ; a4 = src start for part 1
-    move.l  a3,a5_save                 ; (a5 is our var base — save/restore)
-    ; Save a5 (VarBase) — we need a5 for blitter ops
-    ; Use d2 as line count
+    add.l   d0,d1                      ; d1.l = source start address
+    move.l  d1,a4                      ; a4 = source start
+
     move.w  #SCREEN_H,d2
-    sub.w   d3,d2                     ; d2 = SCREEN_H - VertRoll
+    sub.w   d3,d2                      ; d2 = line count (SCREEN_H - VertRoll)
 
     bsr     WaitBlit
 
-    ; Blitter: A→D copy, no shift, minterm $CA (A copy)
-    ; BLTCON0: $09F0 = use A, D; minterm A; all word masks
-    move.w  #$09F0,CUSTOM+BLTCON0
-    move.w  #$0000,CUSTOM+BLTCON1
-    move.w  #$FFFF,CUSTOM+BLTAFWM
-    move.w  #$FFFF,CUSTOM+BLTALWM
-    move.w  #0,CUSTOM+BLTAMOD
-    move.w  #0,CUSTOM+BLTDMOD
+    ; Configure blitter: A→D copy (minterm $F0 = D:=A), no D-read (useD=0)
+    ; BLTCON0 = useA(bit11) | minterm $F0 = $0800|$F0 = $08F0
+    move.w  #$08F0,CUSTOM+BLTCON0      ; A→D copy, no shift
+    move.w  #$0000,CUSTOM+BLTCON1      ; no fill, no shift B
+    move.w  #$FFFF,CUSTOM+BLTAFWM      ; first word mask: all bits
+    move.w  #$FFFF,CUSTOM+BLTALWM      ; last word mask: all bits
+    move.w  #0,CUSTOM+BLTAMOD          ; source modulo = 0
+    move.w  #0,CUSTOM+BLTDMOD          ; dest modulo = 0
 
-    ; Source A — move address to d0 so we can swap high/low words
+    ; Write source A pointer (high word first — mandatory for OCS)
     move.l  a4,d0
+    swap    d0
+    move.w  d0,CUSTOM+BLTAPTH          ; high word first
+    swap    d0
     move.w  d0,CUSTOM+BLTAPTL
-    swap    d0
-    move.w  d0,CUSTOM+BLTAPTH
 
-    ; Dest D
+    ; Write dest D pointer (high word first)
     move.l  a3,d0
-    move.w  d0,CUSTOM+BLTDPTL
     swap    d0
-    move.w  d0,CUSTOM+BLTDPTH
+    move.w  d0,CUSTOM+BLTDPTH          ; high word first
+    swap    d0
+    move.w  d0,CUSTOM+BLTDPTL
 
-    ; BLTSIZE: (lines << 6) | words_per_line
-    ; words per line = PLANE_STRIDE/2 = 20
+    ; Trigger blit: BLTSIZE = (lines<<6)|words — write LAST (starts the blit)
     move.w  d2,d0
     lsl.w   #6,d0
-    or.w    #(PLANE_STRIDE/2),d0
-    move.w  d0,CUSTOM+BLTSIZE
+    or.w    #(PLANE_STRIDE/2),d0       ; words per line = 40/2 = 20
+    move.w  d0,CUSTOM+BLTSIZE          ; ← triggers blit
 
-    bsr     WaitBlit
-
-    ; Part 2 destination: a3 + (SCREEN_H-VertRoll) * PLANE_STRIDE
-    ; Compute as long in d0, store in temp memory word (68000: no .l index in lea)
+    ; ── PART 2: copy source[0..VertRoll-1] → dest[H-VertRoll..H-1] ──
+    ; Dest start = a3 + (SCREEN_H-VertRoll)*PLANE_STRIDE
     move.w  #SCREEN_H,d1
-    sub.w   d3,d1                      ; d1 = SCREEN_H - VertRoll (word)
-    mulu    #PLANE_STRIDE,d1           ; d1 = byte offset (long result from mulu)
+    sub.w   d3,d1                      ; d1 = SCREEN_H - VertRoll
+    mulu    #PLANE_STRIDE,d1           ; d1.l = byte offset
     move.l  a3,d0
-    add.l   d1,d0                      ; d0 = dest address for part 2
-    move.l  d0,a5_save2                ; store in temp long
+    add.l   d1,d0                      ; d0.l = dest start address
+    move.l  d0,a4                      ; reuse a4 for dest part 2
 
-    move.w  #$09F0,CUSTOM+BLTCON0
+    bsr     WaitBlit                   ; wait for part 1 to finish
+
+    move.w  #$08F0,CUSTOM+BLTCON0
     move.w  #$0000,CUSTOM+BLTCON1
     move.w  #$FFFF,CUSTOM+BLTAFWM
     move.w  #$FFFF,CUSTOM+BLTALWM
     move.w  #0,CUSTOM+BLTAMOD
     move.w  #0,CUSTOM+BLTDMOD
 
+    ; Source A = a2 (plane base = source[0])
     move.l  a2,d0
-    move.w  d0,CUSTOM+BLTAPTL
     swap    d0
     move.w  d0,CUSTOM+BLTAPTH
+    swap    d0
+    move.w  d0,CUSTOM+BLTAPTL
 
-    move.l  a5_save2,d0
-    move.w  d0,CUSTOM+BLTDPTL
+    ; Dest D = a4 (computed dest start for part 2)
+    move.l  a4,d0
     swap    d0
     move.w  d0,CUSTOM+BLTDPTH
+    swap    d0
+    move.w  d0,CUSTOM+BLTDPTL
 
-    move.w  d3,d0                      ; lines = VertRoll
+    ; Trigger: lines = VertRoll
+    move.w  d3,d0
     lsl.w   #6,d0
     or.w    #(PLANE_STRIDE/2),d0
-    move.w  d0,CUSTOM+BLTSIZE
-
-    bsr     WaitBlit
+    move.w  d0,CUSTOM+BLTSIZE          ; ← triggers blit
 
     dbra    d4,.roll_plane
 
 .no_roll:
-    movem.l (sp)+,d0-d4/a0-a2
+    bsr     WaitBlit                   ; ensure last blit done before returning
+    movem.l (sp)+,d0-d4/a0-a4
     rts
 
 ; Temp storage for blitter dest ptrs (can't use a5 — it's VarBase)
@@ -1270,83 +1315,102 @@ DoVerticalRoll:
 *=============================================================================
 
 DoNoiseOverlay:
-    movem.l d0-d4/a0-a3,-(sp)
+    ; Overlay LFSR noise onto plane 0 of the draw buffer using the blitter.
+    ; Uses A-only copy (minterm $F0, useA=1 useD=0) — no fill mode, no D-read.
+    ; BLTCON1 must be $0000 — any non-zero value risks enabling fill mode
+    ; (bit1=IFE, bit0=EFE) which corrupts memory far beyond the destination.
+    movem.l d0-d7/a0-a3,-(sp)
 
-    move.l  VAR_NOISEBUF(a5),a2        ; noise source
-    move.l  VAR_DRAWBUF(a5),a3         ; draw buffer
-    move.w  VAR_DISTORT(a5),d5         ; distortion level
+    move.l  VAR_NOISEBUF(a5),a2        ; noise source (chip RAM)
+    move.l  VAR_DRAWBUF(a5),a3         ; draw buffer (chip RAM)
+    move.w  VAR_DISTORT(a5),d5         ; distortion 0-256
 
-    ; Only overlay noise if distort > 32
     cmp.w   #32,d5
     blt     .no_noise
 
-    ; We blit noise into all 5 planes using D OR (A AND B)
-    ; where A = noise plane, B = noise plane (shifted) for mask sparsity
-    ; minterm $CA = (A AND (NOT B)) OR (B AND D) .. let's use simpler:
-    ; minterm $FC = A OR D  (makes lots of noise — scale by distort)
-
-    ; Apply to PLANE 0 only for "luma" static (keeps colour planes cleaner)
+    ; ── Blit 1: copy noise plane → plane 0 of draw buffer ──
+    ; BLTCON0: useA=1 (bit11), useD=0, minterm=$F0 (D:=A)
+    ;   = $0800 | $F0 = $08F0
+    ; BLTCON1: $0000 — NO fill mode, NO B-shift, NO direction flip
+    ;   (any non-zero value here risks IFE/EFE fill corruption)
     bsr     WaitBlit
 
-    move.w  #$09FC,CUSTOM+BLTCON0      ; use A,D; minterm A OR D
-    move.w  #$0002,CUSTOM+BLTCON1      ; shift A left 1 (vary pattern)
+    move.w  #$08F0,CUSTOM+BLTCON0      ; A→D copy, no shift, no D-read
+    move.w  #$0000,CUSTOM+BLTCON1      ; CRITICAL: fill mode OFF
+    move.w  #$FFFF,CUSTOM+BLTAFWM      ; first word mask: all bits
+    move.w  #$FFFF,CUSTOM+BLTALWM      ; last word mask: all bits
+    move.w  #0,CUSTOM+BLTAMOD          ; source A modulo = 0
+    move.w  #0,CUSTOM+BLTDMOD          ; dest D modulo = 0
+
+    ; Source A = noise plane
+    move.l  a2,d0
+    swap    d0
+    move.w  d0,CUSTOM+BLTAPTH          ; high word first (OCS requirement)
+    swap    d0
+    move.w  d0,CUSTOM+BLTAPTL
+
+    ; Dest D = plane 0 of draw buffer
+    move.l  a3,d0
+    swap    d0
+    move.w  d0,CUSTOM+BLTDPTH          ; high word first
+    swap    d0
+    move.w  d0,CUSTOM+BLTDPTL
+
+    ; BLTSIZE = (lines<<6)|words = (256<<6)|20 — triggers the blit
+    move.w  #(256<<6)|20,CUSTOM+BLTSIZE
+
+    ; ── Blit 2: blank 3 random dropout lines in plane 0 ──
+    ; Strategy: use BLTCON0=$0100 (useD=1 only, minterm=0 → write zero)
+    ; BLTCON1 must remain $0000.
+    move.l  VAR_LFSR(a5),d7            ; LFSR state for random Y positions
+    move.w  #2,d4                       ; dbra counter: 3 iterations (2 downto 0)
+
+.dropout_loop:
+    ; Advance LFSR one step
+    lsr.l   #1,d7
+    bcc     .dp1
+    eor.l   #LFSR_POLY,d7
+.dp1:
+    ; Pick Y position from LFSR bits 7-0
+    move.l  d7,d0
+    and.w   #$00FF,d0                   ; Y = 0..255
+
+    bsr     WaitBlit
+
+    ; Compute line address: d1 = a3 + Y*PLANE_STRIDE
+    move.w  d0,d2
+    and.l   #$0000FFFF,d2              ; zero-extend Y to long
+    mulu    #PLANE_STRIDE,d2           ; d2.l = Y * 40
+    move.l  a3,d1
+    add.l   d2,d1                       ; d1 = plane0_base + Y*stride
+
+    ; Configure blitter: D:=0 (minterm=0, useD=1 reads then writes 0)
+    ; Actually cleaner: useA=1, BLTADAT=$0000, minterm=$F0 → writes A=0
+    ; This avoids useD=1 which requires reading dest (wastes cycles).
+    move.w  #$08F0,CUSTOM+BLTCON0      ; A→D, minterm=$F0
+    move.w  #$0000,CUSTOM+BLTCON1
     move.w  #$FFFF,CUSTOM+BLTAFWM
     move.w  #$FFFF,CUSTOM+BLTALWM
     move.w  #0,CUSTOM+BLTAMOD
     move.w  #0,CUSTOM+BLTDMOD
 
-    ; Source A = noise plane
-    move.l  a2,d0
-    move.w  d0,CUSTOM+BLTAPTL
-    swap    d0
-    move.w  d0,CUSTOM+BLTAPTH
+    ; BLTADAT=$0000: blitter uses this as A data (no BLTAPT needed for const fill)
+    move.w  #$0000,CUSTOM+BLTADAT
 
-    ; Dest D = plane 0 of draw buffer
-    move.l  a3,d0
-    move.w  d0,CUSTOM+BLTDPTL
-    swap    d0
-    move.w  d0,CUSTOM+BLTDPTH
-
-    ; Full screen: 256 lines, 20 words
-    move.w  #(256<<6)|20,CUSTOM+BLTSIZE
-
-    bsr     WaitBlit
-
-    ; Draw random "black dropout" lines (blank 1-3 lines)
-    ; Use LFSR to pick Y positions
-    move.l  VAR_LFSR(a5),d7
-    move.w  #2,d4                       ; 3 dropout lines
-
-.dropout_loop:
-    lsr.l   #1,d7
-    bcc     .dp1
-    eor.l   #LFSR_POLY,d7
-.dp1:
-    move.l  d7,d0
-    and.w   #$00FF,d0                   ; Y position 0-255
-
-    ; Blank this line in plane 0 only
-    bsr     WaitBlit
-
-    move.l  a3,d1                       ; plane 0 base
-    mulu    #PLANE_STRIDE,d0
-    add.l   d0,d1
-
-    move.w  #$0100,CUSTOM+BLTCON0      ; D fill with zero (no source)
-    move.w  #$0000,CUSTOM+BLTCON1
-    move.w  #$FFFF,CUSTOM+BLTAFWM
-    move.w  #$FFFF,CUSTOM+BLTALWM
-    move.w  d1,CUSTOM+BLTDPTL
+    ; Dest D = computed line address
     swap    d1
     move.w  d1,CUSTOM+BLTDPTH
-    ; BLTADAT = 0 (fills with 0)
-    move.w  #$0000,CUSTOM+BLTDAT
-    move.w  #(1<<6)|20,CUSTOM+BLTSIZE  ; 1 line, 20 words
+    swap    d1
+    move.w  d1,CUSTOM+BLTDPTL
+
+    ; Blit 1 line * 20 words
+    move.w  #(1<<6)|20,CUSTOM+BLTSIZE
 
     dbra    d4,.dropout_loop
 
 .no_noise:
-    movem.l (sp)+,d0-d4/a0-a3
+    bsr     WaitBlit                    ; ensure last blit complete
+    movem.l (sp)+,d0-d7/a0-a3
     rts
 
 *=============================================================================
@@ -1358,7 +1422,7 @@ DoNoiseOverlay:
 *=============================================================================
 
 DoChromaSmear:
-    movem.l d0-d3/a0,-(sp)
+    movem.l d0-d4/a0,-(sp)
 
     move.l  VAR_DRAWBUF(a5),a0
     move.w  VAR_DISTORT(a5),d4
@@ -1380,24 +1444,27 @@ DoChromaSmear:
 
     bsr     WaitBlit
 
-    ; BLTCON0: use A and D, minterm A OR D = $FC, shift=1
-    move.w  #$19FC,CUSTOM+BLTCON0      ; shift A by 1
+    ; BLTCON0: use A and D, minterm A OR D = $FC, shift A left by 1
+    ; BLTCON1 shift field is for B; A shift is in BLTCON0 bits 15-12.
+    ; Shift A by 1: BLTCON0 = (1<<12)|useA(11)|useD(8)|$FC = $19FC. ✓
+    move.w  #$19FC,CUSTOM+BLTCON0      ; shift A by 1, A OR D → D
     move.w  #$0000,CUSTOM+BLTCON1
     move.w  #$FFFF,CUSTOM+BLTAFWM
-    move.w  #$7FFF,CUSTOM+BLTALWM      ; mask last bit (barrel shift fill)
+    move.w  #$7FFF,CUSTOM+BLTALWM      ; mask last bit (shifted fill)
     move.w  #0,CUSTOM+BLTAMOD
     move.w  #0,CUSTOM+BLTDMOD
 
-    ; Source A = this plane
+    ; Source A = this plane (high word first — OCS requirement)
+    swap    d0
+    move.w  d0,CUSTOM+BLTAPTH          ; high first
+    swap    d0
     move.w  d0,CUSTOM+BLTAPTL
-    swap    d0
-    move.w  d0,CUSTOM+BLTAPTH
-    swap    d0
 
-    ; Dest D = same plane
-    move.w  d0,CUSTOM+BLTDPTL
+    ; Dest D = same plane (high word first)
     swap    d0
-    move.w  d0,CUSTOM+BLTDPTH
+    move.w  d0,CUSTOM+BLTDPTH          ; high first
+    swap    d0
+    move.w  d0,CUSTOM+BLTDPTL
 
     move.w  #(256<<6)|20,CUSTOM+BLTSIZE
 
@@ -1408,7 +1475,7 @@ DoChromaSmear:
 
 .smear_done:
 .no_smear:
-    movem.l (sp)+,d0-d3/a0
+    movem.l (sp)+,d0-d4/a0
     rts
 
 *=============================================================================
@@ -1426,7 +1493,8 @@ BuildNormalCopperList:
     ; Write to the INACTIVE copper list (VAR_COPLIST2 becomes active after swap)
     move.l  VAR_COPLIST2(a5),a0
 
-    move.l  VAR_DISPBUF(a5),a1         ; display buffer
+    ; Use the clean source buffer for normal display — guaranteed unmodified
+    move.l  VAR_SRCBUF(a5),a1          ; clean source = always pristine image
 
     ; Header: write copper MOVE pairs (reg, value) directly into list buffer.
     ; Every value here is a compile-time constant — no DC.W in code stream.
@@ -1580,67 +1648,59 @@ BuildEffectCopperList:
     ; -------------------------------------------------------
     lea     LineShiftTable,a3
 
-    move.w  #0,d6                       ; d6 = current line Y (0..255)
-
-    ; We only insert a copper WAIT+MOVE block when the shift changes
-    ; (optimisation: skip lines with same shift as previous)
-    move.w  #$7FFF,d5                   ; d5 = previous shift (impossible value)
+    move.w  #0,d6                       ; d6 = current line Y
+    move.w  #$7FFF,d5                   ; d5 = previous shift (impossible sentinel)
 
 .line_loop:
     cmp.w   #SCREEN_H,d6
     bge     .line_done
 
-    ; Read shift for this line.
-    ; 68000 has no scaled index — compute &LineShiftTable[d6] explicitly.
+    ; Read shift for this line (68000-safe: no scaled index)
     move.w  d6,d4
-    add.w   d4,d4                       ; d4 = d6*2 (word table byte offset)
+    add.w   d4,d4                       ; d4 = Y*2 (byte offset into word table)
     move.l  a3,a1
-    adda.w  d4,a1                       ; a1 = &LineShiftTable[d6]
-    move.w  (a1),d4                     ; d4 = shift for this line (signed word)
+    adda.w  d4,a1                       ; a1 = &LineShiftTable[Y]
+    move.w  (a1),d4                     ; d4 = signed shift for this line
 
-    ; Has shift changed from previous line?
+    ; Skip if shift unchanged from previous line (saves copper space)
     cmp.w   d5,d4
-    beq     .line_skip                  ; same — no copper entry needed
+    beq     .line_skip
+    move.w  d4,d5
 
-    move.w  d4,d5                       ; remember this shift as 'previous'
-
-    ; --- Emit copper WAIT for this scanline ---
-    ; WAIT word 1: (vpos << 8) | $01   — wait for this beam line, any hpos
-    ; WAIT word 2: $FF7E               — enable all position bits
+    ; --- Emit copper WAIT ---
+    ; WAIT word1: (vpos<<8)|$01  — vpos in bits 15-8, bit0 must=1
+    ; WAIT word2: $FF7E          — VP mask=$7F, HP mask=$3F, bit0=0
+    ; vpos = FIRST_LINE + Y  (guaranteed <= $FF by loop limit above)
     move.w  d6,d0
-    add.w   #FIRST_LINE,d0             ; d0.w = actual PAL beam line number
-    lsl.w   #8,d0                      ; move to bits 15-8
-    or.w    #$0001,d0                  ; set BFD=0, hpos wait=$00
+    add.w   #FIRST_LINE,d0             ; actual beam line (8-bit safe)
+    lsl.w   #8,d0                      ; vpos → bits 15-8
+    or.w    #$0001,d0                  ; bit0=1 identifies WAIT
     move.w  d0,(a0)+                   ; WAIT word 1
     move.w  #$FF7E,(a0)+              ; WAIT word 2
 
-    ; --- Compute y*PLANE_STRIDE into d1 (long) ---
-    ; d6 is a word; zero-extend to long before mulu to be safe on 68000
+    ; --- Compute row offset: d1.l = Y * PLANE_STRIDE ---
     move.w  d6,d1
-    and.l   #$0000FFFF,d1             ; zero-extend word to long
-    mulu    #PLANE_STRIDE,d1          ; d1.l = y * 40
+    and.l   #$0000FFFF,d1             ; zero-extend Y to long
+    mulu    #PLANE_STRIDE,d1          ; d1.l = Y * 40
 
-    ; --- Byte shift from pixel shift (word-aligned) ---
+    ; --- Byte shift: pixel_shift → byte offset (even, word-aligned) ---
     move.w  d4,d2
-    asr.w   #3,d2                      ; d2 = pixel_shift / 8 (byte offset)
-    and.w   #$FFFE,d2                  ; round to even (word boundary)
+    asr.w   #3,d2                      ; /8: pixels → bytes
+    and.w   #$FFFE,d2                  ; force even (word boundary)
 
-    ; --- Emit copper BPLxPT pairs for all 5 planes ---
-    ; Pattern for each plane:
-    ;   compute addr = plane_base + y*stride + byte_shift
-    ;   emit: BPLxPTH, high_word(addr)
-    ;         BPLxPTL, low_word(addr)
+    ; --- Emit 5 plane pointer pairs ---
+    ; Each: BPLxPTH, highword(addr), BPLxPTL, lowword(addr)
 
     ; Plane 0 — BPL1PT
-    move.l  a4,d0                      ; draw buffer base
-    add.l   d1,d0                      ; + y*stride
-    add.w   d2,d0                      ; + byte shift (word add, safe: chip RAM < 512K)
+    move.l  a4,d0
+    add.l   d1,d0
+    add.w   d2,d0
     move.l  d0,d3
-    swap    d3                         ; d3.w = high word of address
+    swap    d3
     move.w  #BPL1PTH,(a0)+
-    move.w  d3,(a0)+                   ; high word
+    move.w  d3,(a0)+
     move.w  #BPL1PTL,(a0)+
-    move.w  d0,(a0)+                   ; low word
+    move.w  d0,(a0)+
 
     ; Plane 1 — BPL2PT
     move.l  a4,d0
@@ -1695,7 +1755,7 @@ BuildEffectCopperList:
     bra     .line_loop
 
 .line_done:
-    ; End of copper list
+    ; Copper list terminator — $FFFF,$FFFE = END
     move.w  #$FFFF,(a0)+
     move.w  #$FFFE,(a0)+
 
@@ -1965,6 +2025,7 @@ a5_save2:       DS.L    1
 ; Pointer variables (filled by AllocChipMem)
 ScreenBufA:     DS.L    1       ; ptr to chip-alloc'd screen buffer A
 ScreenBufB:     DS.L    1       ; ptr to chip-alloc'd screen buffer B
+ScreenBufC:     DS.L    1       ; ptr to clean source buffer (read-only during effect)
 NoisePlane:     DS.L    1       ; ptr to chip-alloc'd noise bitplane
 CopListA:       DS.L    1       ; ptr to chip-alloc'd copper list A
 CopListB:       DS.L    1       ; ptr to chip-alloc'd copper list B
